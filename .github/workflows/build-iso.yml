@@ -1,0 +1,245 @@
+name: Build MiniOS ISO
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-iso.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: 生成构建脚本
+        run: |
+          mkdir -p out
+          cat > build.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y live-build debootstrap squashfs-tools xorriso \
+            debian-archive-keyring mtools dosfstools syslinux syslinux-common \
+            isolinux grub-efi-amd64-bin grub-pc-bin
+
+          mkdir -p /build && cd /build
+
+          lb config \
+            --mode debian \
+            --distribution bookworm \
+            --architectures amd64 \
+            --binary-images iso-hybrid \
+            --debian-installer none \
+            --memtest none \
+            --cache false \
+            --iso-application MiniOS \
+            --iso-volume MiniOS \
+            --bootappend-live "boot=live components persistence quiet hostname=minios username=user locales=zh_CN.UTF-8 timezone=Asia/Shanghai"
+
+          mkdir -p config/package-lists
+          cat > config/package-lists/minios.list.chroot <<'EOF'
+          # 图形界面（Xfce 很轻量，虚拟机里很流畅）
+          xserver-xorg xserver-xorg-input-libinput libgl1-mesa-dri xinit dbus-x11
+          lightdm lightdm-gtk-greeter
+          xfce4 xfce4-terminal thunar mousepad
+          # 常用应用与网络
+          firefox-esr network-manager network-manager-gnome sudo
+          # 中文支持
+          locales fonts-wqy-microhei
+          # 虚拟机增强（VMware / QEMU：自适应分辨率、共享剪贴板）
+          open-vm-tools-desktop spice-vdagent qemu-guest-agent
+          # 持久化存储设置工具
+          parted
+          EOF
+
+          mkdir -p config/hooks/normal
+          cat > config/hooks/normal/0100-branding.hook.chroot <<'EOF'
+          #!/bin/sh
+          sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="MiniOS 1.0"/; s/^NAME=.*/NAME="MiniOS"/' /etc/os-release
+          EOF
+          chmod +x config/hooks/normal/0100-branding.hook.chroot
+
+          cat > config/hooks/normal/0200-vboxvideo.hook.chroot <<'EOF'
+          #!/bin/sh
+          # 从 X.Org 官方源码编译 VirtualBox 开源显示驱动（失败则跳过，不影响整体构建）
+          (
+            set -e
+            apt-get update
+            apt-get install -y --no-install-recommends build-essential pkg-config \
+              xserver-xorg-dev wget ca-certificates xz-utils
+            cd /tmp
+            wget -q https://www.x.org/releases/individual/driver/xf86-video-vboxvideo-1.0.1.tar.xz
+            tar -xf xf86-video-vboxvideo-1.0.1.tar.xz
+            cd xf86-video-vboxvideo-1.0.1
+            ./configure --prefix=/usr
+            make -j"$(nproc)"
+            make install
+            cd /
+            rm -rf /tmp/xf86-video-vboxvideo-1.0.1*
+          ) || echo "WARNING: vboxvideo 驱动编译失败，已跳过"
+          EOF
+          chmod +x config/hooks/normal/0200-vboxvideo.hook.chroot
+
+          cat > config/hooks/normal/0300-initramfs-wait.hook.chroot <<'EOF'
+          #!/bin/sh
+          # 在 live-boot 开始扫描前，先等磁盘枚举完成，避免第二块虚拟盘/物理盘来不及出现
+          # （属于预防措施。如果仍然识别不到，可把下面的 sleep 3 改大一些）
+          (
+            set -e
+            mkdir -p /etc/initramfs-tools/scripts/init-premount
+            cat > /etc/initramfs-tools/scripts/init-premount/minios-wait-disks <<'INITEOF'
+          #!/bin/sh
+          PREREQ=""
+          prereqs() { echo "$PREREQ"; }
+          case "$1" in
+            prereqs) prereqs; exit 0 ;;
+          esac
+          udevadm settle --timeout=10 2>/dev/null || true
+          sleep 3
+          exit 0
+          INITEOF
+            chmod +x /etc/initramfs-tools/scripts/init-premount/minios-wait-disks
+            update-initramfs -u -k all
+          ) || echo "WARNING: initramfs 延时脚本安装失败，已跳过"
+          EOF
+          chmod +x config/hooks/normal/0300-initramfs-wait.hook.chroot
+
+          mkdir -p config/includes.chroot/usr/local/bin config/includes.chroot/etc/skel/Desktop
+          cat > config/includes.chroot/usr/local/bin/setup-persistence <<'EOF'
+          #!/bin/bash
+          # 设置持久化存储：把一块磁盘（虚拟硬盘或物理移动硬盘）做成 persistence 卷
+          # 启动参数里带 persistence 时，系统会扫描本地磁盘，寻找标签为 persistence 的分区
+          set -e
+          if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi
+
+          pause() { read -r -p "按回车键退出 " _; }
+
+          # 只要磁盘（或它的任何分区、逻辑卷）有挂载记录，或正被用作交换分区，就一律排除。
+          # 这样不会误格式化当前运行系统所在的 U 盘/虚拟盘，也不会动已被桌面自动挂载的磁盘。
+          BUSY=""
+          mark_busy() {
+            for dsk in $(lsblk -nsr -o NAME,TYPE "$1" 2>/dev/null | awk '$2=="disk"{print $1}'); do
+              case " $BUSY " in *" $dsk "*) ;; *) BUSY="${BUSY:+$BUSY }$dsk" ;; esac
+            done
+          }
+          for src in $(findmnt -rn -o SOURCE | sort -u); do
+            src=${src%%\[*}
+            case "$src" in /dev/*) mark_busy "$src" ;; esac
+          done
+          for src in $(awk 'NR>1 {print $1}' /proc/swaps); do
+            case "$src" in /dev/*) mark_busy "$src" ;; esac
+          done
+
+          CANDIDATES=""
+          EXCLUDED=""
+          for d in $(lsblk -dnb -o NAME,TYPE,SIZE,RO | awk '$2=="disk" && $3>0 && $4==0 {print $1}'); do
+            case " $BUSY " in
+              *" $d "*) EXCLUDED="${EXCLUDED:+$EXCLUDED }$d" ;;
+              *) CANDIDATES="${CANDIDATES:+$CANDIDATES }$d" ;;
+            esac
+          done
+
+          if [ -n "$EXCLUDED" ]; then
+            echo "已排除（有挂载记录或正在使用）的磁盘：$EXCLUDED"
+            echo "如果其中有你想用的移动硬盘，请先在文件管理器里点“卸载”，再重新运行本工具。"
+            echo
+          fi
+
+          if [ -z "$CANDIDATES" ]; then
+            echo "没有找到可用的磁盘。"
+            echo "请先添加一块新的虚拟硬盘，或接入一块移动硬盘（并确保它没有被挂载），然后重试。"
+            echo "如果之前已经设置过持久化，则不需要再次设置。"
+            pause
+            exit 1
+          fi
+
+          echo "可选的磁盘（选中的磁盘上所有数据都会被清空）："
+          echo
+          for d in $CANDIDATES; do
+            lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MODEL,TRAN "/dev/$d"
+            echo
+          done
+
+          read -r -p "输入要使用的磁盘名（例如 sdb）： " DISK
+          if [ -z "$DISK" ]; then echo "无效的选择"; pause; exit 1; fi
+          case " $CANDIDATES " in
+            *" $DISK "*) ;;
+            *) echo "无效的选择"; pause; exit 1 ;;
+          esac
+
+          echo
+          echo "选择要保存的内容："
+          echo "  1) 完整保存：文件、设置和安装的软件都保存（推荐）"
+          echo "  2) 只保存个人文件和设置（/home）"
+          read -r -p "输入 1 或 2： " MODE
+          case "$MODE" in
+            1) CONF="/ union" ;;
+            2) CONF="/home" ;;
+            *) echo "无效的选择"; pause; exit 1 ;;
+          esac
+
+          read -r -p "将清空 /dev/$DISK 上的所有数据，输入 yes 确认： " OK
+          if [ "$OK" != "yes" ]; then echo "已取消"; pause; exit 1; fi
+
+          # 动手前最后再确认一次：此刻这块磁盘必须没有任何挂载
+          if lsblk -nr -o MOUNTPOINT "/dev/$DISK" | grep -q .; then
+            echo "检测到 /dev/$DISK 现在有挂载记录，已中止，没有做任何修改。"
+            pause
+            exit 1
+          fi
+
+          wipefs -a "/dev/$DISK" >/dev/null 2>&1 || true
+          parted -s "/dev/$DISK" mklabel gpt mkpart persistence ext4 1MiB 100%
+          udevadm settle
+          sleep 2
+          PART=$(lsblk -ln -o NAME "/dev/$DISK" | tail -n +2 | head -n 1)
+          mkfs.ext4 -F -L persistence "/dev/$PART"
+          mkdir -p /mnt/persist
+          mount "/dev/$PART" /mnt/persist
+          printf '%s\n' "$CONF" > /mnt/persist/persistence.conf
+          sync
+          echo "persistence.conf 内容："
+          cat /mnt/persist/persistence.conf
+          umount /mnt/persist
+
+          echo
+          echo "完成！请重启系统，之后你的数据会被保存。"
+          echo "重启时请保持这块磁盘连接在虚拟机或电脑上。"
+          pause
+          EOF
+          chmod +x config/includes.chroot/usr/local/bin/setup-persistence
+
+          cat > config/includes.chroot/etc/skel/Desktop/setup-persistence.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=设置持久化存储
+          Comment=让数据在重启后不丢失
+          Exec=xfce4-terminal -e /usr/local/bin/setup-persistence
+          Icon=drive-harddisk
+          Terminal=false
+          EOF
+          chmod +x config/includes.chroot/etc/skel/Desktop/setup-persistence.desktop
+
+          lb build
+          cp /build/*.iso /work/out/MiniOS.iso
+          EOS
+
+      - name: 在 Debian 容器中构建 ISO
+        run: |
+          docker run --rm --privileged -v "$PWD:/work" debian:bookworm bash /work/build.sh
+          ls -lh out
+
+      - name: 上传 ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniOS-iso
+          path: out/MiniOS.iso
+          compression-level: 0
+          retention-days: 14
