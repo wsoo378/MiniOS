@@ -1,6 +1,6 @@
 # 🐧 MiniOS
 
-一个由 AI（Claude 3.5 Sonnet）深度辅助开发、基于 Debian Live 构建的轻量级 Linux 桌面操作系统。
+一个由 AI（Claude 5.5 Sonnet）深度辅助开发、基于 Debian Live 构建的轻量级 Linux 桌面操作系统。
 
 ## ✨ 核心特性
 
