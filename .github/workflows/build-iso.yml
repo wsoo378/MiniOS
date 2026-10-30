@@ -57,6 +57,8 @@ jobs:
           open-vm-tools-desktop spice-vdagent qemu-guest-agent
           # 持久化存储设置工具
           parted
+          # 运行对话框（Win+R）
+          zenity
           EOF
 
           mkdir -p config/hooks/normal
@@ -111,7 +113,7 @@ jobs:
           EOF
           chmod +x config/hooks/normal/0300-initramfs-wait.hook.chroot
 
-          mkdir -p config/includes.chroot/usr/local/bin config/includes.chroot/etc/skel/Desktop
+          mkdir -p config/includes.chroot/usr/local/bin config/includes.chroot/etc/skel/Desktop config/includes.chroot/etc/xdg/autostart
           cat > config/includes.chroot/usr/local/bin/setup-persistence <<'EOF'
           #!/bin/bash
           # 设置持久化存储：把一块磁盘（虚拟硬盘或物理移动硬盘）做成 persistence 卷
@@ -226,6 +228,63 @@ jobs:
           Terminal=false
           EOF
           chmod +x config/includes.chroot/etc/skel/Desktop/setup-persistence.desktop
+
+          cat > config/includes.chroot/usr/local/bin/admin-terminal <<'EOF'
+          #!/bin/sh
+          # 管理员命令行：打开一个 root 终端
+          exec xfce4-terminal --title="管理员命令行" -x sudo -i
+          EOF
+          chmod +x config/includes.chroot/usr/local/bin/admin-terminal
+
+          cat > config/includes.chroot/usr/local/bin/run-dialog <<'EOF'
+          #!/bin/bash
+          # 类似 Windows 的“运行”对话框（Win+R）
+          INPUT=$(zenity --entry --title="运行" \
+            --text="输入程序或命令的名称，然后按回车：" \
+            --ok-label="确定" --cancel-label="取消" --width=420 2>/dev/null) || exit 0
+
+          # 去掉首尾空白
+          INPUT=$(printf '%s' "$INPUT" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+          [ -z "$INPUT" ] && exit 0
+
+          # 输入 cmd：打开管理员命令行
+          LOWER=$(printf '%s' "$INPUT" | tr 'A-Z' 'a-z')
+          case "$LOWER" in
+            cmd|cmd.exe)
+              exec /usr/local/bin/admin-terminal
+              ;;
+          esac
+
+          # 其他输入：当作普通命令，以当前用户身份运行
+          FIRST=${INPUT%% *}
+          if ! command -v "$FIRST" >/dev/null 2>&1; then
+            zenity --error --no-markup --title="运行" --text="找不到“$FIRST”，请检查名称是否正确。" 2>/dev/null
+            exit 1
+          fi
+          setsid sh -c "$INPUT" >/dev/null 2>&1 &
+          EOF
+          chmod +x config/includes.chroot/usr/local/bin/run-dialog
+
+          cat > config/includes.chroot/usr/local/bin/minios-setup-keys <<'EOF'
+          #!/bin/sh
+          # 首次登录时设置快捷键：Win 键 → 应用程序菜单；Win+R → 运行对话框
+          MARK="$HOME/.config/minios-keys-set"
+          [ -e "$MARK" ] && exit 0
+          CH=xfce4-keyboard-shortcuts
+          xfconf-query -c "$CH" -n -t string -p "/commands/custom/Super_L" -s "xfce4-popup-applicationsmenu"
+          xfconf-query -c "$CH" -n -t string -p "/commands/custom/Super_R" -s "xfce4-popup-applicationsmenu"
+          xfconf-query -c "$CH" -n -t string -p "/commands/custom/<Super>r" -s "/usr/local/bin/run-dialog"
+          mkdir -p "$HOME/.config" && touch "$MARK"
+          EOF
+          chmod +x config/includes.chroot/usr/local/bin/minios-setup-keys
+
+          cat > config/includes.chroot/etc/xdg/autostart/minios-keys.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=MiniOS 快捷键设置
+          Exec=/usr/local/bin/minios-setup-keys
+          Terminal=false
+          EOF
 
           lb build
           cp /build/*.iso /work/out/MiniOS.iso
