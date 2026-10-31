@@ -5,12 +5,16 @@ on:
   push:
     paths:
       - ".github/workflows/build-iso.yml"
+      - "*.png"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
+      - name: 获取仓库文件（包含开机动画图片）
+        uses: actions/checkout@v4
+
       - name: 释放磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
@@ -27,7 +31,7 @@ jobs:
           apt-get update
           apt-get install -y live-build debootstrap squashfs-tools xorriso \
             debian-archive-keyring mtools dosfstools syslinux syslinux-common \
-            isolinux grub-efi-amd64-bin grub-pc-bin
+            isolinux grub-efi-amd64-bin grub-pc-bin python3-pil
 
           mkdir -p /build && cd /build
 
@@ -41,7 +45,7 @@ jobs:
             --cache false \
             --iso-application MiniOS \
             --iso-volume MiniOS \
-            --bootappend-live "boot=live components persistence quiet hostname=minios username=user locales=zh_CN.UTF-8 timezone=Asia/Shanghai"
+            --bootappend-live "boot=live components persistence quiet splash vt.global_cursor_default=0 hostname=minios username=user locales=zh_CN.UTF-8 timezone=Asia/Shanghai"
 
           mkdir -p config/package-lists
           cat > config/package-lists/minios.list.chroot <<'EOF'
@@ -59,6 +63,8 @@ jobs:
           parted
           # 运行对话框（Win+R）
           zenity
+          # 开机动画
+          plymouth
           EOF
 
           mkdir -p config/hooks/normal
@@ -88,6 +94,114 @@ jobs:
           ) || echo "WARNING: vboxvideo 驱动编译失败，已跳过"
           EOF
           chmod +x config/hooks/normal/0200-vboxvideo.hook.chroot
+
+          # ---- 开机动画：使用仓库里的 PNG 图片（优先 logo.png，否则取根目录下第一张 .png）----
+          LOGO=""
+          for f in /work/logo.png /work/*.png; do
+            if [ -f "$f" ]; then LOGO="$f"; break; fi
+          done
+
+          if [ -n "$LOGO" ]; then
+            cat > /tmp/prep_logo.py <<'PYEOF'
+          import sys
+          from PIL import Image
+
+          src, dst = sys.argv[1], sys.argv[2]
+          im = Image.open(src).convert("RGB")
+
+          # 找到 logo 内容的范围（背景是纯黑），四周留一点边距
+          mask = im.convert("L").point(lambda p: 255 if p > 24 else 0)
+          box = mask.getbbox()
+          if box:
+              pad = 16
+              box = (max(box[0] - pad, 0), max(box[1] - pad, 0),
+                     min(box[2] + pad, im.width), min(box[3] + pad, im.height))
+              im = im.crop(box)
+
+          # 最宽缩到 720 像素
+          if im.width > 720:
+              im = im.resize((720, round(im.height * 720 / im.width)), Image.LANCZOS)
+          im.save(dst, optimize=True)
+          print("logo prepared:", im.size)
+          PYEOF
+            python3 /tmp/prep_logo.py "$LOGO" /tmp/logo-clean.png
+
+            {
+              cat <<'HEADEOF'
+          #!/bin/sh
+          # 安装 MiniOS 开机动画：logo 淡入，然后缓慢淡出淡入，盖住开机日志
+          (
+            set -e
+            D=/usr/share/plymouth/themes/minios
+            mkdir -p "$D"
+
+            base64 -d > "$D/logo.png" <<'B64EOF'
+          HEADEOF
+              base64 -w 76 /tmp/logo-clean.png
+              cat <<'TAILEOF'
+          B64EOF
+
+            cat > "$D/minios.plymouth" <<'PLYEOF'
+          [Plymouth Theme]
+          Name=MiniOS
+          Description=MiniOS boot logo with fade effect
+          ModuleName=script
+
+          [script]
+          ImageDir=/usr/share/plymouth/themes/minios
+          ScriptFile=/usr/share/plymouth/themes/minios/minios.script
+          PLYEOF
+
+            cat > "$D/minios.script" <<'SCREOF'
+          # MiniOS boot splash: fade in, then slowly fade out and in (breathing)
+          Window.SetBackgroundTopColor(0, 0, 0);
+          Window.SetBackgroundBottomColor(0, 0, 0);
+
+          logo_image = Image("logo.png");
+          screen_w = Window.GetWidth();
+          screen_h = Window.GetHeight();
+
+          # logo width = 38% of the screen width
+          logo_w = screen_w * 0.38;
+          logo_h = logo_image.GetHeight() * logo_w / logo_image.GetWidth();
+          logo_image = logo_image.Scale(logo_w, logo_h);
+
+          logo_sprite = Sprite(logo_image);
+          logo_sprite.SetX(Window.GetWidth() / 2 - logo_image.GetWidth() / 2);
+          logo_sprite.SetY(Window.GetHeight() / 2 - logo_image.GetHeight() / 2);
+          logo_sprite.SetZ(100);
+          logo_sprite.SetOpacity(0);
+
+          ticks = 0;
+
+          fun refresh_callback ()
+          {
+            ticks++;
+            if (ticks < 75)
+            {
+              # first 1.5 seconds: fade in
+              opacity = ticks / 75;
+            }
+            else
+            {
+              # then a 3 second cycle between 100% and 35% opacity
+              opacity = 0.675 + 0.325 * Math.Cos((ticks - 75) * 2 * 3.14159265 / 150);
+            }
+            logo_sprite.SetOpacity(opacity);
+          }
+
+          Plymouth.SetRefreshFunction(refresh_callback);
+          SCREOF
+
+            plymouth-set-default-theme minios
+            update-initramfs -u -k all
+          ) || echo "WARNING: 开机动画安装失败，已跳过"
+          TAILEOF
+            } > config/hooks/normal/0250-plymouth.hook.chroot
+            chmod +x config/hooks/normal/0250-plymouth.hook.chroot
+          else
+            echo "WARNING: 仓库里没有找到 PNG 图片，已跳过开机动画"
+          fi
 
           cat > config/hooks/normal/0300-initramfs-wait.hook.chroot <<'EOF'
           #!/bin/sh
